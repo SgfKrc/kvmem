@@ -242,6 +242,15 @@ llama_memory_context_ptr llama_memory_kvmem_mtp::init_batch(
         uint32_t n_ubatch,
         bool embd_all) {
     GGML_UNUSED(embd_all);
+    // Symmetric to llama_memory_kvmem::init_batch(), which re-binds the target
+    // half of this domain at the start of its own sequence. Capture dispatch
+    // is one process-wide binding, and binding only in the constructor leaves
+    // the MTP half correct only while the process holds exactly one draft
+    // context: a second follower (a per-slot draft, or a chain that grows a
+    // local tail per stage) would send every is_mtp=1 graph and harvest to
+    // whichever follower was constructed last. Re-binding here makes the
+    // invariant local to this instance instead of a startup accident.
+    kvmem_mtp_bind(this);
     do {
         balloc.split_reset();
         std::vector<llama_ubatch> ubatches;

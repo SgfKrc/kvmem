@@ -1,6 +1,7 @@
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-execution.h"
 
+#include "llama-kvmem-diag.h"
 #include "llama-kvmem-hooks.h"
 #include "llama-memory-kvmem.h"
 #include "llama-memory-kvmem-mtp.h"
@@ -14,6 +15,10 @@
 
 
 void kvmem_capture_bind(llama_memory_kvmem * mem) {
+    if (kvmem_diag_enabled()) {
+        kvmem_diag("KVMEM_BIND capture_bind this=%p prev=%p\n",
+                (const void *) mem, (const void *) kvmem_current_execution().memory);
+    }
     kvmem_current_execution().memory = mem;
 }
 
@@ -28,6 +33,10 @@ void kvmem_capture_unbind(llama_memory_kvmem * mem) {
 }
 
 void kvmem_mtp_bind(llama_memory_kvmem_mtp * mem) {
+    if (kvmem_diag_enabled()) {
+        kvmem_diag("KVMEM_BIND mtp_bind this=%p prev=%p\n",
+                (const void *) mem, (const void *) kvmem_current_execution().mtp);
+    }
     kvmem_current_execution().mtp = mem;
 }
 
@@ -49,8 +58,18 @@ void kvmem_capture_reset_q() {
     }
 }
 
+static int kvmem_graph_is_mtp = 0; // set by kvmem_capture_on_new_graph()
+
 void kvmem_capture_register(struct ggml_tensor * t, int il, char which) {
     if (kvmem_current_execution().mtp && kvmem_current_execution().mtp->is_mtp_layer(il)) {
+        if (kvmem_diag_enabled()) {
+            // Routing is layer-id based, not graph based: a trunk graph that
+            // numbered its layers with the tail's global ids would land here
+            // and lose its capture to a no-op. graph_is_mtp says which graph
+            // the layer id came from, so a 0 here is a lost capture.
+            kvmem_diag("KVMEM_ROUTE graph_is_mtp=%d il=%d which=%c -> mtp\n",
+                    kvmem_graph_is_mtp, il, which);
+        }
         kvmem_current_execution().mtp->register_capture(t, il, which);
         return;
     }
@@ -60,6 +79,17 @@ void kvmem_capture_register(struct ggml_tensor * t, int il, char which) {
 }
 
 void kvmem_capture_on_new_graph(int is_mtp) {
+    kvmem_graph_is_mtp = is_mtp;
+    if (kvmem_diag_enabled()) {
+        // Which instance the capture of this graph lands on, and the other
+        // binding next to it: a split chain rebinds memory per stage, so a
+        // mismatched pair here is the whole bug class this line exists for.
+        kvmem_diag("KVMEM_BIND capture_on_new_graph is_mtp=%d this=%p other=%p\n", is_mtp,
+                (const void *) (is_mtp ? (void *) kvmem_current_execution().mtp
+                                       : (void *) kvmem_current_execution().memory),
+                (const void *) (is_mtp ? (void *) kvmem_current_execution().memory
+                                       : (void *) kvmem_current_execution().mtp));
+    }
     if (is_mtp) {
         if (kvmem_current_execution().mtp) {
             kvmem_current_execution().mtp->capture_on_new_graph();
@@ -72,6 +102,15 @@ void kvmem_capture_on_new_graph(int is_mtp) {
 }
 
 void kvmem_capture_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp) {
+    if (kvmem_diag_enabled()) {
+        // The receiving instance of this ubatch's harvest. Must equal the
+        // instance capture_on_new_graph() reported for the same graph.
+        kvmem_diag("KVMEM_BIND harvest_pending enter is_mtp=%d this=%p other=%p\n", is_mtp,
+                (const void *) (is_mtp ? (void *) kvmem_current_execution().mtp
+                                       : (void *) kvmem_current_execution().memory),
+                (const void *) (is_mtp ? (void *) kvmem_current_execution().memory
+                                       : (void *) kvmem_current_execution().mtp));
+    }
     if (is_mtp) {
         if (kvmem_current_execution().mtp) {
             kvmem_current_execution().mtp->harvest_pending(sched);
