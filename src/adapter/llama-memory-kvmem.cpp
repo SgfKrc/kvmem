@@ -2700,6 +2700,13 @@ bool llama_memory_kvmem::prepare_ubatches(
         const std::vector<llama_ubatch> & ubatches,
         uint32_t n_new_tokens,
         llama_kv_cache::slot_info_vec_t & sinfos) {
+    // See init_batch(): a split chain holds one memory instance per stage and
+    // capture dispatch is process-wide, so this stage must re-bind before its
+    // graph is built. A hybrid memory reaches here through
+    // llama_memory_kvmem_hybrid::init_batch(), which calls prepare_ubatches()
+    // directly and never passes through llama_memory_kvmem::init_batch(), so
+    // the binding has to be re-established here as well.
+    kvmem_capture_bind(this);
     const uint32_t old_rows = store_n_tokens();
     uint32_t rewrite_begin = old_rows;
     for (const auto & ub : ubatches) {
@@ -2766,6 +2773,20 @@ llama_memory_context_ptr llama_memory_kvmem::init_batch(
         uint32_t n_ubatch,
         bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // A split chain builds one llama_context per stage, so this process holds
+    // one llama_memory_kvmem per stage, while capture dispatch is a single
+    // process-wide binding (llama-kvmem-execution.h: "one target context and
+    // its MTP follower form one execution domain"). Without this re-bind every
+    // graph capture and every harvest_ubatch() of the head stage is delivered
+    // to whichever stage constructed its memory last (the tail), which leaves
+    // this stage's evaluation_queue_ unconsumed and its content frontier at
+    // zero forever. That is invisible while no pressure reselect runs and
+    // fails the first one with "graph rows are not complete". Binding here is
+    // ordered correctly because a stage's init_batch(), graph build, compute
+    // and harvest_ubatch() run as one sequence; the next stage re-binds in its
+    // own init_batch().
+    kvmem_capture_bind(this);
 
     do {
         balloc.split_reset();
@@ -6323,8 +6344,18 @@ void llama_memory_kvmem::run_native_transaction(const std::vector<uint32_t> & se
     harvest_gpu_v_commit();
     if (!content_->stamp().valid || evaluation_cursor_ != evaluation_queue_.size() ||
         content_->evaluated() != content_->stamp().frontier ||
-        (purpose != NativePurpose::Pressure && content_->reserved() != content_->stamp().frontier))
+        (purpose != NativePurpose::Pressure && content_->reserved() != content_->stamp().frontier)) {
+        LLAMA_LOG_ERROR("%s: KVMem native transaction precondition failed: purpose=%d valid=%d "
+                "cursor=%zu/%zu evaluated=%llu frontier=%llu reserved=%llu speculative=%d "
+                "pending_capture=%zu posq=%zu store_n=%u\n",
+                __func__, (int) purpose, (int) content_->stamp().valid,
+                evaluation_cursor_, evaluation_queue_.size(),
+                (unsigned long long) content_->evaluated(),
+                (unsigned long long) content_->stamp().frontier,
+                (unsigned long long) content_->reserved(),
+                (int) speculative_evaluation_, pending_capture_.size(), pos_queue_.size(), store_n_tokens());
         throw kvmem::MemoryError(kvmem::MemoryErrorCode::Pending, "graph rows are not complete");
+    }
     auto backend = std::make_shared<NativeBackend>(*this, selected, purpose);
     kvmem::MemorySession session(backend);
     std::vector<uint64_t> committed;
