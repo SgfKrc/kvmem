@@ -29,6 +29,17 @@ public:
 
     bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
+    // The inherited implementations read mem_attn, which is the *native* kv cache
+    // this class borrows, not the KVMem slot-pool wrapping it. Under KVMem the
+    // native rows are only the resident working set, so the base class would
+    // report an empty sequence for a fully staged-out history. Ask the KVMem half
+    // instead and combine with the stock recurrent half exactly the way
+    // llama_memory_hybrid does (min = max of the two mins, max = min of the two
+    // maxes): the recurrent state lives at a single position and cannot resume
+    // anywhere else, so it still bounds the range.
+    llama_pos seq_pos_min(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
     llama_memory_kvmem * attn_kvmem() { return attn_kvmem_.get(); }
 
 private:

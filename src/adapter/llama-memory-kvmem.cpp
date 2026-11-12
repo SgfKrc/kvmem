@@ -2829,6 +2829,17 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
         harvest_gpu_v_commit();
         if (mtp_) mtp_->truncate_cached(0);
         reset_policy();
+    } else if (!replay_ && seq_id <= 0 && p0 > 0 &&
+            (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
+        // A tail trim [p0, end) is the server's prompt-cache rollback: it drops the
+        // generated suffix so the next prefill continues from the cached prefix.
+        // kv_->seq_rm above removed the native rows, but the store still describes
+        // the removed suffix, and the next register_append would extend that
+        // phantom tail instead of starting at p0 -- leaving the store (and with it
+        // seq_pos_max, the attention mask and row_positions_) one history longer
+        // than the model. Rewind it with the same primitive the
+        // llama_kvmem_truncate_cached hook uses, so both halves shrink together.
+        truncate_cached((uint32_t) p0);
     }
     return true;
 }
@@ -2853,12 +2864,42 @@ void llama_memory_kvmem::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     kv_->seq_div(seq_id, p0, p1, d);
 }
 
+// The logical extent of a sequence lives in KvMemStore, not in the native cache.
+// The native attention cache only holds the blocks that are resident on the GPU
+// right now, so `kv_->seq_pos_min/max` describes the working set and not the
+// history: after a stage-out it reports -1 for a sequence that is still there.
+// The store is the authority, and its block table is a contiguous prefix of the
+// original token positions (KvMemStore::register_append assigns orig_pos_start
+// monotonically from total_tokens_ and truncate_to only pops from the back), so
+// the extent is [first block's start, last block's end). Resident or not, every
+// block in that range is part of the sequence's logical history -- which is what
+// llama_kv_cache promises and what the server's reuse/truncation checks read.
 llama_pos llama_memory_kvmem::seq_pos_min(llama_seq_id seq_id) const {
-    return kv_->seq_pos_min(seq_id);
+    if (!runtime_ || seq_id != 0) {
+        return kv_->seq_pos_min(seq_id);
+    }
+    const auto & blocks = runtime_->store().blocks();
+    if (blocks.empty()) {
+        // Nothing registered: fall back to the native half, which may still hold
+        // rows that arrived before the store was rebuilt.
+        return kv_->seq_pos_min(seq_id);
+    }
+    return (llama_pos) blocks.front().orig_pos_start;
 }
 
 llama_pos llama_memory_kvmem::seq_pos_max(llama_seq_id seq_id) const {
-    return kv_->seq_pos_max(seq_id);
+    if (!runtime_ || seq_id != 0) {
+        return kv_->seq_pos_max(seq_id);
+    }
+    const auto & blocks = runtime_->store().blocks();
+    if (blocks.empty()) {
+        return kv_->seq_pos_max(seq_id);
+    }
+    const llama_pos store_max = (llama_pos) (blocks.back().orig_pos_end() - 1);
+    // The native half can never be ahead of the store (a batch is registered in
+    // init_batch before it is evaluated), but a stale trailing row is worse than
+    // an extra comparison here.
+    return std::max(store_max, kv_->seq_pos_max(seq_id));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_kvmem::memory_breakdown() const {

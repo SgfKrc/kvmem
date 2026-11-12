@@ -154,6 +154,41 @@ bool llama_memory_kvmem_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_
             }
         }
     }
+    if (attn_kvmem_ && attn_kvmem_->replay()) {
+        // A hole only the attention half may see: the driver restores GDN itself.
+        return attn_kvmem_->seq_rm(seq_id, p0, p1);
+    }
+    // Any other partial removal is an external contract question: the caller is
+    // about to declare the sequence shorter than it is, so *both* halves have to
+    // accept it. The recurrent half can only rewind through its per-ubatch
+    // snapshots (n_rs_seq); with none it refuses the request -- and this memory
+    // must refuse it too. Answering true while trimming only the attention half
+    // leaves GDN holding a state that has already absorbed the tokens being
+    // dropped, i.e. a prefix the model never actually computed, and it also makes
+    // common_context_can_seq_rm() classify this context as "partial removal
+    // supported", which switches off the server's context checkpoints -- the only
+    // mechanism that can reuse a prefix of a hybrid memory safely. The stock
+    // llama_memory_hybrid answers this very probe with false for the same model;
+    // this is that answer, not a new policy.
+    if (!recr->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
     return attn_kvmem_ ? attn_kvmem_->seq_rm(seq_id, p0, p1)
                        : get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
+llama_pos llama_memory_kvmem_hybrid::seq_pos_min(llama_seq_id seq_id) const {
+    const llama_pos attn_min = attn_kvmem_ ? attn_kvmem_->seq_pos_min(seq_id)
+                                           : get_mem_attn()->seq_pos_min(seq_id);
+    const llama_pos recr_min = get_mem_recr()->seq_pos_min(seq_id);
+    // Same combination as llama_memory_hybrid: a sequence is only usable from the
+    // position where *both* halves still hold state.
+    return std::max(attn_min, recr_min);
+}
+
+llama_pos llama_memory_kvmem_hybrid::seq_pos_max(llama_seq_id seq_id) const {
+    const llama_pos attn_max = attn_kvmem_ ? attn_kvmem_->seq_pos_max(seq_id)
+                                           : get_mem_attn()->seq_pos_max(seq_id);
+    const llama_pos recr_max = get_mem_recr()->seq_pos_max(seq_id);
+    return std::min(attn_max, recr_max);
 }
